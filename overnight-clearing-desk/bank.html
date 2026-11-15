@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>Bank Desk — Overnight Clearing</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="overnight.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <header>
+    <div class="header-top"><p class="navline">overnight clearing desk · bank treasury</p></div>
+    <h1 id="bank-title">Bank Desk</h1>
+    <p class="sub" id="day-line">Connecting…</p>
+  </header>
+
+  <div class="bank-wrap">
+    <div id="conn-status" class="status-bar" style="display:none;"></div>
+
+    <div id="content">
+      <div class="stat-row">
+        <div class="stat-box"><div class="label">Day</div><div class="value" id="s-day">—</div></div>
+        <div class="stat-box"><div class="label">Market</div><div class="value" id="s-phase">—</div></div>
+        <div class="stat-box"><div class="label">Last SOFR</div><div class="value" id="s-sofr">—</div></div>
+        <div class="stat-box"><div class="label">Fed SRF (ceiling)</div><div class="value" id="s-srf">—</div></div>
+        <div class="stat-box"><div class="label">IORB</div><div class="value" id="s-iorb">—</div></div>
+        <div class="stat-box"><div class="label">Best bid / offer</div><div class="value" id="s-bbo">—</div></div>
+      </div>
+      <div id="shock-banner" class="shock-banner" style="display:none;"></div>
+
+      <div class="two-col">
+        <div>
+          <div class="panel">
+            <h3 style="margin:0 0 6px;color:var(--cyan);">Balance sheet</h3>
+            <div id="bs">Loading…</div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel order-form">
+            <h3 style="margin:0 0 4px;"><span class="bid">Borrow cash</span> · post a bid</h3>
+            <p class="small muted" style="margin:0 0 6px;">You pledge Treasuries and get cash today (a repo). Higher rate = more likely to fill.</p>
+            <div class="row">
+              <label>Rate %</label><input id="bid-rate" class="field" type="number" step="0.01" inputmode="decimal" placeholder="4.45" />
+              <label>Volume $B</label><input id="bid-vol" class="field" type="number" step="0.5" inputmode="decimal" placeholder="2.0" />
+            </div>
+            <div class="row"><button class="neon-btn" id="submit-bid">Submit bid</button><span class="small muted" id="cap-bid"></span></div>
+          </div>
+
+          <div class="panel order-form">
+            <h3 style="margin:0 0 4px;"><span class="offer">Lend cash</span> · post an offer</h3>
+            <p class="small muted" style="margin:0 0 6px;">You give cash today and hold Treasuries as collateral (a reverse repo). Lower rate = more likely to fill.</p>
+            <div class="row">
+              <label>Rate %</label><input id="offer-rate" class="field" type="number" step="0.01" inputmode="decimal" placeholder="4.42" />
+              <label>Volume $B</label><input id="offer-vol" class="field" type="number" step="0.5" inputmode="decimal" placeholder="2.0" />
+            </div>
+            <div class="row"><button class="neon-btn" id="submit-offer">Submit offer</button><span class="small muted" id="cap-offer"></span></div>
+          </div>
+          <div id="msg" class="msg"></div>
+
+          <div class="panel">
+            <h3 style="margin:0 0 4px;">Your orders today</h3>
+            <ul class="list-plain" id="my-orders"></ul>
+            <h3 style="margin:10px 0 4px;">Your trades today</h3>
+            <ul class="list-plain" id="my-trades"></ul>
+          </div>
+        </div>
+      </div>
+
+      <h2>Order book</h2>
+      <p class="sub">Every bank's resting orders. A bid and an offer trade automatically when bid ≥ offer, at the rate of the order that was here first.</p>
+      <div id="book"></div>
+
+      <div id="pnl-panel" class="panel" style="display:none;"></div>
+    </div>
+
+    <div id="ended" class="ended" style="display:none;">The instructor ended this session. This page is closed.</div>
+  </div>
+
+  <script type="module">
+    import * as E from "./overnight-engine.js";
+    import { esc, fmtB, fmtM, fmtPct, balanceSheetHTML, orderLine, tradeLineFor, orderBookHTML, bestQuotes } from "./overnight-ui.js";
+    import { db, configError, explainError, ref, onValue, set, push, runTransaction, serverTimestamp } from "./overnight-db.js";
+
+    const $ = (id) => document.getElementById(id);
+    const params = new URLSearchParams(location.search);
+    const sessionId = (params.get("session") || "").toUpperCase();
+    const stub = params.get("stub") || "";
+    let S = E.normalize(null), loaded = false, hostOnline = true, ended = false, lastError = null;
+
+    function status() {
+      const el = $("conn-status");
+      let text = "", cls = "status-bar";
+      if (configError) { text = configError; cls += " err"; }
+      else if (lastError) { text = lastError; cls += " err"; }
+      else if (loaded && !hostOnline) { text = "The instructor's screen is offline. You can still post orders; they will match when the instructor is back."; cls += " warn"; }
+      el.style.display = text ? "block" : "none";
+      el.className = cls;
+      el.textContent = text;
+    }
+    function fail(e) { lastError = explainError(e); console.error(e); status(); }
+
+    if (!sessionId || !stub) {
+      document.body.innerHTML = "<header><h1>Missing session or bank code</h1><p class='sub'>Use the private link your instructor sent you.</p></header>";
+      throw new Error("missing params");
+    }
+    if (configError) { status(); throw new Error(configError); }
+
+    const base = `sessions/${sessionId}`;
+    onValue(ref(db, `${base}/state`), (snap) => {
+      loaded = true;
+      S = E.normalize(snap.val());
+      render();
+    }, fail);
+    onValue(ref(db, `${base}/meta`), (snap) => {
+      const m = snap.val();
+      ended = !m || m.status === "ended";
+      $("content").style.display = ended ? "none" : "block";
+      $("ended").style.display = ended ? "block" : "none";
+      if (!m) $("ended").textContent = "This session doesn't exist. Check the link from your instructor.";
+    }, fail);
+    onValue(ref(db, `${base}/hostConnections`), (snap) => {
+      hostOnline = Object.keys(snap.val() || {}).length > 0;
+      status();
+    }, fail);
+
+    let shownDay = null;
+    function render() {
+      status();
+      if (shownDay !== null && shownDay !== S.day) msg("");   // clear yesterday's confirmation
+      shownDay = S.day;
+      const b = S.banks[stub];
+      if (!b) {
+        $("bank-title").textContent = "Bank not found";
+        $("day-line").textContent = "This link doesn't match a bank in the session. It may have been removed. Ask your instructor for your link.";
+        $("bs").innerHTML = "";
+        return;
+      }
+      document.title = `${b.name} — Bank Desk`;
+      $("bank-title").textContent = b.name;
+      const open = S.phase === "trading";
+      $("day-line").innerHTML = `Day ${S.day} · market ${open ? "<span class='pos'>OPEN</span>: post bids and offers" : "<span class='neg'>CLOSED</span>: waiting for the instructor to start the next day"}.`;
+      $("s-day").textContent = S.day;
+      $("s-phase").textContent = open ? "OPEN" : "CLOSED";
+      $("s-phase").style.color = open ? "var(--lime)" : "var(--mag)";
+      $("s-sofr").textContent = fmtPct(S.sofr ?? S.lastSofr);
+      $("s-srf").textContent = fmtPct(S.rates.srf);
+      $("s-iorb").textContent = fmtPct(S.rates.iorb);
+      const q = bestQuotes(S);
+      $("s-bbo").textContent = `${fmtPct(q.bestBid)} / ${fmtPct(q.bestOffer)}`;
+
+      // Market cards are public; per-bank and random shocks are shown only to the bank they hit.
+      const sh = S.shock;
+      let shown = null;
+      if (sh && sh.perBank) {
+        const a = sh.perBank[stub];
+        if (a != null) shown = { title: sh.title, text: `Your bank: ${a > 0 ? "+" : ""}${a}B of volatile funding ${a > 0 ? "flowed in (surplus cash)" : "ran off (funding need)"}.` };
+      } else if (sh && sh.stub) {
+        if (sh.stub === stub) shown = { title: "Shock to your bank", text: sh.text };
+      } else if (sh) shown = sh;
+      if (shown) {
+        $("shock-banner").style.display = "block";
+        $("shock-banner").innerHTML = `<strong>${esc(shown.title)}</strong><br>${esc(shown.text)}${shown.note ? `<br><em>${esc(shown.note)}</em>` : ""}`;
+      } else $("shock-banner").style.display = "none";
+
+      $("bs").innerHTML = balanceSheetHTML(S, stub);
+
+      const cap = E.capacity(S, stub);
+      $("cap-bid").textContent = `You can borrow up to ${fmtB(cap.canBorrow, 2)} (free Treasuries).`;
+      $("cap-offer").textContent = `You can lend up to ${fmtB(cap.canLend, 2)} (cash on hand).`;
+      ["submit-bid", "submit-offer", "bid-rate", "bid-vol", "offer-rate", "offer-vol"].forEach((id) => ($(id).disabled = !open));
+
+      // my orders
+      const mine = Object.entries(S.orders).filter(([, o]) => o.stub === stub && o.day === S.day)
+        .sort((a, c) => c[1].ts - a[1].ts);
+      $("my-orders").innerHTML = mine.length ? mine.map(([id, o]) => {
+        const state = o.status === "open" ? "<span class='pos'>in book</span>"
+          : o.status === "filled" ? "<span class='hl'>filled</span>"
+          : `<span class='muted'>${esc(o.note || o.status)}</span>`;
+        const btn = o.status === "open" ? `<button class="neon-btn mini-btn" data-cancel="${id}">cancel</button>` : "";
+        const shown = o.status === "open" ? o : { ...o, remaining: o.volume, filled: o.filled && o.filled < o.volume ? o.filled : 0 };
+        return `<li><span>${orderLine(shown)}</span><span class="spacer"></span>${state}${btn}</li>`;
+      }).join("") : `<li class="muted">No orders yet today.</li>`;
+
+      // my trades
+      const trades = E.tradesForDay(S).filter((t) => t.lender === stub || t.borrower === stub);
+      $("my-trades").innerHTML = trades.length
+        ? trades.map((t) => `<li>${tradeLineFor(t, stub)}</li>`).join("")
+        : `<li class="muted">No trades yet today.</li>`;
+
+      $("book").innerHTML = orderBookHTML(S, { highlightStub: stub });
+
+      // last night's P&L
+      if (b.pnl && S.day > 1) {
+        const p = b.pnl;
+        const line = (lab, v) => `<tr><td>${lab}</td><td class="num ${v < 0 ? "neg" : "pos"}">${fmtM(v)}</td></tr>`;
+        $("pnl-panel").style.display = "block";
+        $("pnl-panel").innerHTML = `<h3 style="margin:0 0 6px;">Last night's net interest income (Day ${S.day - 1})</h3>
+          <table class="bs-table">
+            ${line("Fixed loans @ 6.50%", p.fixedLoans)}
+            ${line("Floating assets @ SOFR + 100", p.floating)}
+            ${line("Reserves at the Fed @ IORB", p.reserves)}
+            ${line("Repo lending income", p.repoIncome)}
+            ${line("Sticky deposits @ 3.50%", p.deposits)}
+            ${line("Repo / Fed borrowing cost", p.repoExpense)}
+            <tr class="bs-total"><td>Net (added to equity)</td><td class="num">${fmtM(b.dayPnL)}</td></tr>
+          </table>`;
+      } else $("pnl-panel").style.display = "none";
+    }
+
+    function msg(text, kind) { $("msg").className = "msg " + (kind || ""); $("msg").textContent = text; }
+
+    async function submit(side) {
+      const rate = parseFloat($(`${side}-rate`).value);
+      const volume = parseFloat($(`${side}-vol`).value);
+      const err = E.validateOrder(S, stub, side, rate, volume);
+      if (err) return msg(err, "err");
+      const warn = E.corridorWarning(S, side, rate);
+      if (warn && !confirm(warn + "\n\nSubmit anyway?")) return;
+      const btn = $(`submit-${side}`);
+      btn.disabled = true;
+      try {
+        await set(push(ref(db, `${base}/state/orders`)), {
+          stub, side, rate: E.r2(rate), volume: E.r2(volume), remaining: E.r2(volume),
+          status: "open", day: S.day, ts: serverTimestamp(),
+        });
+        $(`${side}-rate`).value = ""; $(`${side}-vol`).value = "";
+        msg(`${side === "bid" ? "Bid" : "Offer"} posted: ${side === "bid" ? "borrow" : "lend"} ${fmtB(volume, 2)} @ ${fmtPct(rate)}. It's in the order book and listed under your balance sheet until it trades.`
+          + (hostOnline ? "" : " (The instructor is offline: it will match when they're back.)"), "ok");
+      } catch (e) { fail(e); msg("Order not sent: " + explainError(e), "err"); }
+      finally { btn.disabled = false; }
+    }
+    $("submit-bid").onclick = () => submit("bid");
+    $("submit-offer").onclick = () => submit("offer");
+    ["bid", "offer"].forEach((side) => ["rate", "vol"].forEach((f) =>
+      $(`${side}-${f}`).addEventListener("keydown", (e) => { if (e.key === "Enter") submit(side); })));
+
+    $("my-orders").addEventListener("click", async (e) => {
+      const id = e.target.closest("[data-cancel]")?.dataset.cancel;
+      if (!id) return;
+      try {
+        const res = await runTransaction(ref(db, `${base}/state/orders/${id}`), (o) => {
+          if (o === null) return o;            // not cached yet; Firebase retries with the server value
+          if (o.status !== "open") return;     // already filled/expired: abort
+          o.status = "cancelled"; o.note = "Cancelled by you";
+          return o;
+        });
+        msg(res.committed && res.snapshot.val()?.status === "cancelled" ? "Order cancelled." : "Too late: that order already traded or expired.", res.committed ? "ok" : "err");
+      } catch (err) { fail(err); }
+    });
+
+    window.ocd = { get state() { return S; } };
+  </script>
+</body>
+</html>
